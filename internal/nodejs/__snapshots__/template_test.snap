@@ -5,10 +5,11 @@ FROM node:18 as build
 ENV PORT=8080
 WORKDIR /src
 
-RUN corepack enable && corepack prepare --all
-COPY . .
+RUN corepack enable
 
 RUN yarn install
+
+COPY . .
 
 # Build if we can build it
 
@@ -24,10 +25,11 @@ FROM node:18 as build
 ENV PORT=8080
 WORKDIR /src
 
-RUN corepack enable && corepack prepare --all
-COPY . .
+RUN corepack enable
 
 RUN yarn install
+
+COPY . .
 
 # Build if we can build it
 
@@ -43,10 +45,11 @@ FROM node:18 as build
 ENV PORT=8080
 WORKDIR /src
 
-RUN corepack enable && corepack prepare --all
-COPY . .
+RUN corepack enable
 
 RUN yarn install
+
+COPY . .
 
 # Build if we can build it
 
@@ -62,10 +65,11 @@ FROM node:18 as build
 ENV PORT=8080
 WORKDIR /src
 
-RUN corepack enable && corepack prepare --all
-COPY . .
+RUN corepack enable
 
 RUN yarn install
+
+COPY . .
 
 # Build if we can build it
 RUN yarn build
@@ -81,10 +85,11 @@ FROM node:18 as build
 ENV PORT=8080
 WORKDIR /src
 
-RUN corepack enable && corepack prepare --all
-COPY . .
+RUN corepack enable
 
 RUN yarn install
+
+COPY . .
 
 # Build if we can build it
 RUN yarn build
@@ -106,10 +111,11 @@ WORKDIR /src
 COPY --from=bun-runtime /usr/local/bin/bun /usr/local/bin
 COPY --from=bun-runtime /usr/local/bin/bunx /usr/local/bin
 
-RUN corepack enable && corepack prepare --all
-COPY . .
+RUN corepack enable
 
 RUN bun install
+
+COPY . .
 
 # Build if we can build it
 

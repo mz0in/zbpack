@@ -1,7 +1,7 @@
 package zeaburpack
 
 import (
-	"bufio"
+	"bytes"
 	"fmt"
 	"math/rand"
 	"os"
@@ -12,9 +12,12 @@ import (
 	"strings"
 
 	"github.com/pan93412/envexpander"
+	"github.com/zeabur/zbpack/pkg/types"
 )
 
 type buildImageOptions struct {
+	PlanType            types.PlanType
+	PlanMeta            types.PlanMeta
 	Dockerfile          string
 	AbsPath             string
 	UserVars            map[string]string
@@ -28,6 +31,9 @@ type buildImageOptions struct {
 	// ProxyRegistry is the registry to be used for the image.
 	// See referenceConstructor for more details.
 	ProxyRegistry *string
+
+	// PushImage is a flag to indicate if the image should be pushed to the registry.
+	PushImage bool
 }
 
 func buildImage(opt *buildImageOptions) error {
@@ -82,7 +88,12 @@ func buildImage(opt *buildImageOptions) error {
 			continue
 		}
 
-		dockerfileEnv += "ENV " + key + " " + value + "\n"
+		value = strings.ReplaceAll(value, "\n", "\\n")
+		value = strings.ReplaceAll(value, "'", "\\'")
+		value = strings.ReplaceAll(value, "\"", "\\\"")
+		value = strings.ReplaceAll(value, "\\", "\\\\")
+
+		dockerfileEnv += "ENV " + key + " \"" + value + "\"\n"
 	}
 
 	for _, stageLine := range stageLines {
@@ -95,7 +106,7 @@ func buildImage(opt *buildImageOptions) error {
 
 	err := os.MkdirAll(path.Join(tempDir, buildID), 0o755)
 	if err != nil {
-		return err
+		return fmt.Errorf("create temp dir: %w", err)
 	}
 
 	dockerfilePath := path.Join(tempDir, buildID, "Dockerfile")
@@ -104,77 +115,68 @@ func buildImage(opt *buildImageOptions) error {
 		return fmt.Errorf("write Dockerfile: %w", err)
 	}
 
-	dockerIgnore := []string{".next", "node_modules"}
+	dockerIgnore := []string{".next", "node_modules", ".zeabur"}
 	dockerIgnorePath := path.Join(tempDir, buildID, ".dockerignore")
 	err = os.WriteFile(dockerIgnorePath, []byte(strings.Join(dockerIgnore, "\n")), 0o644)
 	if err != nil {
 		return fmt.Errorf("write .dockerignore: %w", err)
 	}
 
-	dockerCmd := []string{
-		"buildx",
+	buildKitCmd := []string{
 		"build",
-		"-t", opt.ResultImage,
-		"-f", dockerfilePath,
+		"--frontend", "dockerfile.v0",
+		"--local", "context=" + opt.AbsPath,
+		"--local", "dockerfile=" + path.Dir(dockerfilePath),
 	}
 
-	if opt.PlainDockerProgress {
-		dockerCmd = append(dockerCmd, "--progress", "plain")
+	if opt.PlanMeta["serverless"] == "true" || opt.PlanMeta["outputDir"] != "" || opt.PlanType == types.PlanTypeStatic {
+		buildKitCmd = append(buildKitCmd, "--output", "type=local,dest="+path.Join(os.TempDir(), "zbpack/buildkit"))
 	} else {
-		dockerCmd = append(dockerCmd, "--progress", "tty")
+		t := "image"
+		if !opt.PushImage {
+			// -> docker registry
+			t = "docker"
+		}
+
+		o := "type=" + t + ",name=" + opt.ResultImage
+		if opt.PushImage {
+			o += ",push=true"
+		}
+		buildKitCmd = append(buildKitCmd, "--output", o)
 	}
 
 	if opt.CacheFrom != nil && len(*opt.CacheFrom) > 0 {
-		dockerCmd = append(dockerCmd, "--cache-from", *opt.CacheFrom)
+		buildKitCmd = append(buildKitCmd, "--import-cache type=registry,ref="+*opt.CacheFrom)
 	}
 
 	if opt.CacheTo != nil && len(*opt.CacheTo) > 0 {
-		dockerCmd = append(dockerCmd, "--cache-to", *opt.CacheTo)
+		buildKitCmd = append(buildKitCmd, "--export-cache", *opt.CacheTo)
 	}
 
-	dockerCmd = append(dockerCmd, opt.AbsPath)
-
-	cmd := exec.Command("docker", dockerCmd...)
-	cmd.Env = append(os.Environ(), "DOCKER_BUILDKIT=1")
-
-	if opt.HandleLog == nil {
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
-		err := cmd.Run()
-		if err != nil {
-			println("failed to run docker build: " + err.Error())
-			return err
-		}
-		return nil
+	if opt.PlainDockerProgress {
+		buildKitCmd = append(buildKitCmd, "--progress", "plain")
+	} else {
+		buildKitCmd = append(buildKitCmd, "--progress", "tty")
 	}
 
-	errPipe, err := cmd.StderrPipe()
+	buildctlCmd := exec.Command("buildctl", buildKitCmd...)
+	buildctlCmd.Stderr = NewHandledWriter(os.Stderr, opt.HandleLog)
+	output, err := buildctlCmd.Output()
 	if err != nil {
-		return err
+		return fmt.Errorf("run buildctl build: %w", err)
 	}
 
-	outPipe, err := cmd.StdoutPipe()
-	if err != nil {
-		return err
+	if opt.PushImage {
+		return nil // buildctl have handled push
 	}
 
-	if err := cmd.Start(); err != nil {
-		return err
+	dockerLoadCmd := exec.Command("docker", "load")
+	dockerLoadCmd.Stdin = bytes.NewReader(output)
+	dockerLoadCmd.Stdout = NewHandledWriter(os.Stdout, opt.HandleLog)
+	dockerLoadCmd.Stderr = NewHandledWriter(os.Stderr, opt.HandleLog)
+	if err := dockerLoadCmd.Run(); err != nil {
+		return fmt.Errorf("run docker load: %w", err)
 	}
 
-	go func() {
-		scanner := bufio.NewScanner(errPipe)
-		for scanner.Scan() {
-			(*opt.HandleLog)(scanner.Text())
-		}
-	}()
-
-	go func() {
-		scanner := bufio.NewScanner(outPipe)
-		for scanner.Scan() {
-			(*opt.HandleLog)(scanner.Text())
-		}
-	}()
-
-	return cmd.Wait()
+	return nil
 }

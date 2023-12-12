@@ -15,13 +15,12 @@ import (
 	esbuild "github.com/evanw/esbuild/pkg/api"
 	uuid2 "github.com/google/uuid"
 	cp "github.com/otiai10/copy"
-	"github.com/zeabur/zbpack/internal/utils"
 	"github.com/zeabur/zbpack/pkg/types"
 )
 
 // TransformServerless will transform build output of Next.js app to the serverless build output format of Zeabur
 // It is trying to implement the same logic as build function of https://github.com/vercel/vercel/tree/main/packages/next/src/index.ts
-func TransformServerless(image, workdir string) error {
+func TransformServerless(workdir string) error {
 
 	// create a tmpDir to store the build output of Next.js app
 	uuid := uuid2.New().String()
@@ -47,32 +46,12 @@ func TransformServerless(image, workdir string) error {
 
 	fmt.Println("=> Copying build output from image")
 
-	err := cp.Copy(workdir, tmpDir)
+	err := cp.Copy(path.Join(os.TempDir(), "/zbpack/buildkit"), path.Join(tmpDir))
 	if err != nil {
-		return err
+		return fmt.Errorf("copy buildkit output to tmp dir: %w", err)
 	}
-
-	err = utils.CopyFromImage(image, "/src/.next", tmpDir)
-	if err != nil {
-		return err
-	}
-
-	err = utils.CopyFromImage(image, "/src/node_modules", tmpDir)
-	if err != nil {
-		return err
-	}
-
-	err = utils.CopyFromImage(image, "/src/package.json", tmpDir)
-	if err != nil {
-		return err
-	}
-
-	_ = os.RemoveAll(path.Join(workdir, ".zeabur"))
 
 	serverlessFunctionPages := mapset.NewSet()
-	prerenderPaths := mapset.NewSet()
-	staticPages := mapset.NewSet()
-	staticAppPages := mapset.NewSet()
 
 	fmt.Println("=> Collect serverless function pages")
 
@@ -109,26 +88,6 @@ func TransformServerless(image, workdir string) error {
 		return nil
 	})
 
-	fmt.Println("=> Collect SSG pages")
-
-	_ = filepath.Walk(nextOutputServerPagesDir, func(path string, info os.FileInfo, err error) error {
-		if strings.HasSuffix(path, ".html") {
-			filePath := strings.TrimPrefix(path, nextOutputServerPagesDir)
-			staticPages.Add(filePath)
-		}
-		return nil
-	})
-
-	_ = filepath.Walk(nextOutputServerAppDir, func(path string, info os.FileInfo, err error) error {
-		if strings.HasSuffix(path, ".html") {
-			filePath := strings.TrimPrefix(path, nextOutputServerAppDir)
-			staticAppPages.Add(filePath)
-		}
-		return nil
-	})
-
-	serverlessFunctionPages.Add("/_next/image")
-
 	fmt.Println("=> Copying static asset files")
 
 	err = os.MkdirAll(path.Join(zeaburOutputDir, "static"), 0755)
@@ -142,7 +101,7 @@ func TransformServerless(image, workdir string) error {
 	}
 
 	err = cp.Copy(path.Join(workdir, "public"), path.Join(zeaburOutputDir, "static"))
-	if err != nil {
+	if err != nil && !strings.Contains(err.Error(), "no such file or directory") {
 		return fmt.Errorf("copy public dir: %w", err)
 	}
 
@@ -168,113 +127,21 @@ func TransformServerless(image, workdir string) error {
 		return fmt.Errorf("render launcher template: %w", err)
 	}
 
-	file, err := os.ReadFile(path.Join(nextOutputDir, "prerender-manifest.json"))
-	if err != nil {
-		return fmt.Errorf("read prerender manifest: %w", err)
-	}
-
-	type prerenderManifestRoute struct {
-		SrcRoute                 *string         `json:"srcRoute"`
-		DataRoute                string          `json:"dataRoute"`
-		InitialRevalidateSeconds utils.IntOrBool `json:"initialRevalidateSeconds"`
-	}
-
-	type prerenderManifest struct {
-		Routes        map[string]prerenderManifestRoute `json:"routes"`
-		DynamicRoutes map[string]prerenderManifestRoute `json:"dynamicRoutes"`
-	}
-
-	var pm prerenderManifest
-	err = json.Unmarshal(file, &pm)
-	if err != nil {
-		return fmt.Errorf("unmarshal prerender manifest: %w", err)
-	}
-
-	for route, config := range pm.Routes {
-		if config.InitialRevalidateSeconds.IsInt {
-			serverlessFunctionPages.Add(route)
-			serverlessFunctionPages.Add(config.DataRoute)
-		}
-	}
-
-	for _, config := range pm.DynamicRoutes {
-		serverlessFunctionPages.Add(config.DataRoute)
-		prerenderPaths.Add(config.DataRoute)
-	}
-
 	fmt.Println("=> Creating serverless function symlinks")
 
-	// if there is any serverless function page, create the first function page and symlinks for other function pages
-	if serverlessFunctionPages.Cardinality() > 0 {
-
-		// create the first function page
-		firstFuncPage := serverlessFunctionPages.Pop().(string)
-		err = constructNextFunction(zeaburOutputDir, firstFuncPage, tmpDir)
-		if err != nil {
-			return fmt.Errorf("construct next function: %w", err)
-		}
-
-		// create symlinks for other function pages
-		for i := range serverlessFunctionPages.Iter() {
-			p := i.(string)
-			funcPath := path.Join(zeaburOutputDir, "functions", p+".func")
-			if p == "/" {
-				funcPath = path.Join(zeaburOutputDir, "functions", "index.func")
-			}
-
-			err = os.MkdirAll(path.Dir(funcPath), 0755)
-			if err != nil {
-				return fmt.Errorf("create function dir: %w", err)
-			}
-
-			target := path.Join(zeaburOutputDir, "functions", firstFuncPage+".func")
-			if firstFuncPage == "/" {
-				target = path.Join(zeaburOutputDir, "functions", "index.func")
-			}
-
-			err = os.Symlink(target, funcPath)
-			if err != nil && !os.IsExist(err) {
-				return fmt.Errorf("create symlink: %w", err)
-			}
-		}
+	// Create the __next function route
+	err = constructNextFunction(zeaburOutputDir, tmpDir)
+	if err != nil {
+		return fmt.Errorf("construct next function: %w", err)
 	}
 
-	for route, config := range pm.Routes {
-		if config.InitialRevalidateSeconds.IsInt {
-			r := route
-			if config.SrcRoute != nil {
-				r = *config.SrcRoute
-			}
-			prerenderPaths.Add(r)
-			prerenderPaths.Add(config.DataRoute)
-		}
+	cfg := types.ZeaburOutputConfig{
+		Routes: []types.ZeaburOutputConfigRoute{
+			// redirect all requests not match any static files to __next function
+			{Src: "/(.*)", Dest: "/__next"},
+		},
 	}
 
-	for r := range prerenderPaths.Iter() {
-		err = writePrerenderConfig(zeaburOutputDir, r.(string))
-		if err != nil {
-			return fmt.Errorf("write prerender config: %w", err)
-		}
-	}
-
-	// copy static pages which is rendered by Next.js at build time, so they will be served as static files
-	for i := range staticPages.Iter() {
-		p := i.(string)
-		err = cp.Copy(path.Join(nextOutputDir, "server/pages", p), path.Join(zeaburOutputDir, "static", p))
-		if err != nil {
-			return fmt.Errorf("copy static page: %w", err)
-		}
-	}
-
-	for i := range staticAppPages.Iter() {
-		p := i.(string)
-		err = cp.Copy(path.Join(nextOutputDir, "server/app", p), path.Join(zeaburOutputDir, "static", p))
-		if err != nil {
-			return fmt.Errorf("copy static page: %w", err)
-		}
-	}
-
-	cfg := types.ZeaburOutputConfig{Containerized: false, Routes: make([]types.ZeaburOutputConfigRoute, 0)}
 	cfgBytes, err := json.Marshal(cfg)
 	if err != nil {
 		return fmt.Errorf("marshal config: %w", err)
@@ -290,27 +157,6 @@ func TransformServerless(image, workdir string) error {
 	err = buildMiddleware(tmpDir, zeaburOutputDir)
 	if err != nil {
 		return fmt.Errorf("build middleware: %w", err)
-	}
-
-	return nil
-}
-
-func writePrerenderConfig(zeaburOutputDir, r string) error {
-	prerenderConfigFilename := r + ".prerender-config.json"
-	if r == "/" {
-		prerenderConfigFilename = "index.prerender-config.json"
-	}
-
-	pcPath := path.Join(zeaburOutputDir, "functions", prerenderConfigFilename)
-
-	err := os.MkdirAll(path.Dir(pcPath), 0755)
-	if err != nil {
-		return fmt.Errorf("create prerender config dir: %w", err)
-	}
-
-	err = os.WriteFile(pcPath, []byte("{\"type\": \"Prerender\"}"), 0644)
-	if err != nil {
-		return fmt.Errorf("write prerender config: %w", err)
 	}
 
 	return nil

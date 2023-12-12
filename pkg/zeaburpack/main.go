@@ -7,11 +7,12 @@ import (
 	"path"
 	"strings"
 
-	"github.com/zeabur/zbpack/internal/nodejs/nextjs"
-	"github.com/zeabur/zbpack/internal/static"
-
+	cp "github.com/otiai10/copy"
+	"github.com/samber/lo"
 	"github.com/spf13/afero"
-
+	"github.com/zeabur/zbpack/internal/nodejs/nextjs"
+	"github.com/zeabur/zbpack/internal/nodejs/nuxtjs"
+	"github.com/zeabur/zbpack/internal/static"
 	"github.com/zeabur/zbpack/pkg/plan"
 	"github.com/zeabur/zbpack/pkg/types"
 )
@@ -63,10 +64,19 @@ type BuildOptions struct {
 	// ProxyRegistry is the registry to be used for the image.
 	// See referenceConstructor for more details.
 	ProxyRegistry *string
+
+	// PushImage is a flag to indicate if the image should be pushed to the registry.
+	PushImage bool
 }
 
 // Build will analyze the project, determine the plan and build the image.
 func Build(opt *BuildOptions) error {
+
+	// clean up the buildkit output directory after the build
+	defer func() {
+		_ = os.RemoveAll(path.Join(os.TempDir(), "zbpack/buildkit"))
+	}()
+
 	wd, err := os.Getwd()
 	if err != nil {
 		return err
@@ -105,7 +115,6 @@ func Build(opt *BuildOptions) error {
 	} else {
 		handleLog = func(log string) {
 			(*opt.HandleLog)(log)
-			println(log)
 		}
 	}
 
@@ -128,12 +137,16 @@ func Build(opt *BuildOptions) error {
 	}
 
 	src := afero.NewBasePathFs(afero.NewOsFs(), *opt.Path)
+	submoduleName := lo.FromPtrOr(opt.SubmoduleName, "")
+	config := plan.NewProjectConfigurationFromFs(src, submoduleName)
+
+	UpdateOptionsOnConfig(opt, config)
 
 	planner := plan.NewPlanner(
 		&plan.NewPlannerOptions{
 			Source:             src,
-			Config:             plan.NewProjectConfigurationFromFs(src),
-			SubmoduleName:      *opt.SubmoduleName,
+			Config:             plan.NewProjectConfigurationFromFs(src, submoduleName),
+			SubmoduleName:      submoduleName,
 			CustomBuildCommand: opt.CustomBuildCommand,
 			CustomStartCommand: opt.CustomStartCommand,
 			OutputDir:          opt.OutputDir,
@@ -166,17 +179,26 @@ func Build(opt *BuildOptions) error {
 		buildImageHandleLog = nil
 	}
 
+	// Remove .zeabur directory if exists
+	_ = os.RemoveAll(path.Join(*opt.Path, ".zeabur"))
+
 	err = buildImage(
 		&buildImageOptions{
+			PlanType: t,
+			PlanMeta: m,
+
 			Dockerfile:          dockerfile,
 			AbsPath:             *opt.Path,
 			UserVars:            *opt.UserVars,
-			ResultImage:         *opt.ResultImage,
 			HandleLog:           buildImageHandleLog,
 			PlainDockerProgress: opt.Interactive == nil || !*opt.Interactive,
-			CacheFrom:           opt.CacheFrom,
-			CacheTo:             opt.CacheTo,
-			ProxyRegistry:       opt.ProxyRegistry,
+
+			ResultImage: *opt.ResultImage,
+			PushImage:   opt.PushImage,
+
+			CacheFrom:     opt.CacheFrom,
+			CacheTo:       opt.CacheTo,
+			ProxyRegistry: opt.ProxyRegistry,
 		},
 	)
 	if err != nil {
@@ -185,11 +207,30 @@ func Build(opt *BuildOptions) error {
 		return err
 	}
 
-	_ = os.RemoveAll(".zeabur")
+	dotZeaburDirInOutput := path.Join(os.TempDir(), "zbpack/buildkit", "src/.zeabur")
+
+	stat, err := os.Stat(dotZeaburDirInOutput)
+	if err == nil && stat.IsDir() {
+		_ = os.MkdirAll(path.Join(*opt.Path, ".zeabur"), 0755)
+		err = cp.Copy(dotZeaburDirInOutput, path.Join(*opt.Path, ".zeabur"))
+		if err != nil {
+			println("Failed to copy .zeabur directory from the output: " + err.Error())
+		}
+	}
 
 	if t == types.PlanTypeNodejs && m["framework"] == string(types.NodeProjectFrameworkNextJs) && m["serverless"] == "true" {
 		println("Transforming build output to serverless format ...")
-		err = nextjs.TransformServerless(*opt.ResultImage, *opt.Path)
+		err = nextjs.TransformServerless(*opt.Path)
+		if err != nil {
+			log.Println("Failed to transform serverless: " + err.Error())
+			handleBuildFailed(err)
+			return err
+		}
+	}
+
+	if t == types.PlanTypeNodejs && m["framework"] == string(types.NodeProjectFrameworkNuxtJs) && m["serverless"] == "true" {
+		println("Transforming build output to serverless format ...")
+		err = nuxtjs.TransformServerless(*opt.Path)
 		if err != nil {
 			log.Println("Failed to transform serverless: " + err.Error())
 			handleBuildFailed(err)
@@ -199,7 +240,17 @@ func Build(opt *BuildOptions) error {
 
 	if t == types.PlanTypeNodejs && m["outputDir"] != "" {
 		println("Transforming build output to serverless format ...")
-		err = static.TransformServerless(*opt.ResultImage, *opt.Path, m)
+		err = static.TransformServerless(*opt.Path, m)
+		if err != nil {
+			println("Failed to transform serverless: " + err.Error())
+			handleBuildFailed(err)
+			return err
+		}
+	}
+
+	if t == types.PlanTypeStatic {
+		println("Transforming build output to serverless format ...")
+		err = static.TransformServerless(*opt.Path, m)
 		if err != nil {
 			println("Failed to transform serverless: " + err.Error())
 			handleBuildFailed(err)
@@ -210,7 +261,7 @@ func Build(opt *BuildOptions) error {
 	if opt.Interactive != nil && *opt.Interactive {
 		handleLog("\n\033[32mBuild successful\033[0m\n")
 		handleLog("\033[90m" + "To run the image, use the following command:" + "\033[0m")
-		if t == types.PlanTypeNodejs && m["outputDir"] != "" {
+		if (t == types.PlanTypeNodejs && m["outputDir"] != "") || t == types.PlanTypeStatic {
 			handleLog("npx serve .zeabur/output/static")
 		} else {
 			handleLog("docker run -p 8080:8080 -it " + *opt.ResultImage)

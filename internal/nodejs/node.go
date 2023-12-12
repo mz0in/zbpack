@@ -18,6 +18,10 @@ type TemplateContext struct {
 	BuildCmd   string
 	StartCmd   string
 
+	Framework  string
+	Serverless bool
+	OutputDir  string
+
 	Bun bool
 }
 
@@ -43,6 +47,9 @@ func getContextBasedOnMeta(meta types.PlanMeta) TemplateContext {
 		InstallCmd:  meta["installCmd"],
 		BuildCmd:    meta["buildCmd"],
 		StartCmd:    meta["startCmd"],
+		Framework:   meta["framework"],
+		Serverless:  meta["serverless"] == "true",
+		OutputDir:   meta["outputDir"],
 
 		// The flag specific to planner/bun.
 		Bun: meta["bun"] == "true",

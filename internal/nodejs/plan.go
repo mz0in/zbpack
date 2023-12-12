@@ -10,12 +10,22 @@ import (
 	"github.com/Masterminds/semver/v3"
 	"github.com/moznion/go-optional"
 	"github.com/spf13/afero"
+	"github.com/spf13/cast"
 	"github.com/zeabur/zbpack/internal/utils"
+	"github.com/zeabur/zbpack/pkg/plan"
 	"github.com/zeabur/zbpack/pkg/types"
+)
+
+const (
+	// ConfigCacheDependencies is the key for the configuration of
+	// whether to cache dependencies.
+	// It is true by default.
+	ConfigCacheDependencies = "cache_dependencies"
 )
 
 type nodePlanContext struct {
 	PackageJSON PackageJSON
+	Config      plan.ImmutableProjectConfiguration
 	Src         afero.Fs
 	Bun         bool
 
@@ -439,34 +449,44 @@ func GetInstallCmd(ctx *nodePlanContext) string {
 	}
 
 	pkgManager := DeterminePackageManager(ctx)
-	var installCmd string
+	shouldCacheDependencies := plan.Cast(ctx.Config.Get(ConfigCacheDependencies), cast.ToBoolE).TakeOr(true)
+
+	var cmds []string
+	if shouldCacheDependencies {
+		cmds = append(cmds, "COPY package.json* tsconfig.json* .npmrc* .")
+	} else {
+		cmds = append(cmds, "COPY . .")
+	}
+
 	switch pkgManager {
 	case types.NodePackageManagerNpm:
-		installCmd = "npm install"
+		cmds = append(cmds, "COPY package-lock.json* .", "RUN npm install")
 	case types.NodePackageManagerPnpm:
-		installCmd = "pnpm install"
+		cmds = append(cmds, "COPY pnpm-lock.yaml* .", "RUN pnpm install")
 	case types.NodePackageManagerBun:
-		installCmd = "bun install"
+		cmds = append(cmds, "COPY bun.lockb* .", "RUN bun install")
 	case types.NodePackageManagerYarn:
-		fallthrough
+		cmds = append(cmds, "COPY yarn.lock* .", "RUN yarn install")
 	default:
-		installCmd = "yarn install"
+		cmds = append(cmds, "RUN yarn install")
 	}
 
 	needPlaywright := DetermineNeedPlaywright(ctx)
 	if needPlaywright {
-		installCmd = `apt-get update && apt-get install -y libnss3 libatk1.0-0 libatk-bridge2.0-0 libcups2 libdbus-1-3 libdrm2 libxkbcommon-x11-0 libxcomposite-dev libxdamage1 libxfixes-dev libxrandr2 libgbm-dev libasound2 && ` + installCmd
+		cmds = append([]string{
+			"RUN apt-get update && apt-get install -y libnss3 libatk1.0-0 libatk-bridge2.0-0 libcups2 libdbus-1-3 libdrm2 libxkbcommon-x11-0 libxcomposite-dev libxdamage1 libxfixes-dev libxrandr2 libgbm-dev libasound2",
+		}, cmds...)
 	}
 
 	needPuppeteer := DetermineNeedPuppeteer(ctx)
 	if needPuppeteer {
-		installCmd = `apt-get update
-RUN apt-get install -y libnss3 libatk1.0-0 libatk-bridge2.0-0 libcups2 libgbm1 libasound2 libpangocairo-1.0-0 libxss1 libgtk-3-0 libxshmfence1 libglu1
-ENV PUPPETEER_CACHE_DIR=/src/.cache/puppeteer
-RUN ` + installCmd
+		cmds = append([]string{
+			"RUN apt-get update && apt-get install -y libnss3 libatk1.0-0 libatk-bridge2.0-0 libcups2 libgbm1 libasound2 libpangocairo-1.0-0 libxss1 libgtk-3-0 libxshmfence1 libglu1",
+			"ENV PUPPETEER_CACHE_DIR=/src/.cache/puppeteer",
+		}, cmds...)
 	}
 
-	*cmd = optional.Some(installCmd)
+	*cmd = optional.Some(strings.Join(cmds, "\n"))
 	return cmd.Unwrap()
 }
 
@@ -509,6 +529,11 @@ func GetStartCmd(ctx *nodePlanContext) string {
 
 	if startCmd, err := cmd.Take(); err == nil {
 		return startCmd
+	}
+
+	if getServerless(ctx) {
+		*cmd = optional.Some("")
+		return cmd.Unwrap()
 	}
 
 	startScript := GetStartScript(ctx)
@@ -592,8 +617,8 @@ func GetStaticOutputDir(ctx *nodePlanContext) string {
 }
 
 func getServerless(ctx *nodePlanContext) bool {
-	expEnv := os.Getenv("EXPERIMENTAL_SERVERLESS")
-	if expEnv != "true" && expEnv != "1" {
+	fcEnv := os.Getenv("FORCE_CONTAINERIZED")
+	if fcEnv == "true" || fcEnv == "1" {
 		return false
 	}
 
@@ -621,7 +646,8 @@ func getServerless(ctx *nodePlanContext) bool {
 
 // GetMetaOptions is the options for GetMeta.
 type GetMetaOptions struct {
-	Src afero.Fs
+	Src    afero.Fs
+	Config plan.ImmutableProjectConfiguration
 
 	CustomBuildCmd *string
 	CustomStartCmd *string
@@ -640,6 +666,7 @@ func GetMeta(opt GetMetaOptions) types.PlanMeta {
 
 	ctx := &nodePlanContext{
 		PackageJSON: packageJSON,
+		Config:      opt.Config,
 		Src:         opt.Src,
 		Bun:         opt.Bun,
 	}
